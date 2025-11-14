@@ -1,0 +1,19 @@
+name: FDSE_pgd
+entrypoint: chmod 777 ./train.sh && bash ./train.sh
+searcher:
+  name: single
+  metric: validation_loss
+  max_length:
+    batches: 1
+max_restarts: 0
+resources:
+  resource_pool: RTX4090
+#RTX4090 RTX3090 GTX1080ti
+environment:
+  image: docker.1ms.run/determinedai/pytorch-ngc:0.38.1
+bind_mounts:
+  - host_path: /data/lry
+    container_path: /run/determined/workdir/data/lry
+
+
+
