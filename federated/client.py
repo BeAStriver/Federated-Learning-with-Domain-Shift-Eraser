@@ -15,11 +15,12 @@ import torch.optim as optim
 
 
 class Client:
-    def __init__(self, cid: int, model: nn.Module, train_loader, test_loader, device='cpu', gamma: float = 0.9):
+    def __init__(self, cid: int, model: nn.Module, train_loader, val_loader, test_loader, device='cpu', gamma: float = 0.9):
         self.cid = cid
         self.device = device
         self.model = copy.deepcopy(model).to(self.device)
         self.train_loader = train_loader
+        self.val_loader = val_loader
         self.test_loader = test_loader
         self.gamma = gamma  # momentum for local running stats (match BN momentum)
         self.criterion = nn.CrossEntropyLoss()
@@ -71,7 +72,7 @@ class Client:
             sigma_g = global_bn_stats[name]['var'].to(self.device)
             d = mu_hat.numel()
             term1 = ((mu_hat - mu_g)**2).sum() / d
-            term2 = ((sigma_hat.abs().sum() - sigma_g.abs().sum()) / d)**2
+            term2 = ((sigma_hat.sum() - sigma_g.sum()) / d)**2
             losses.append((idx, term1 + term2))
             d_list.append(d)
 
@@ -126,6 +127,8 @@ class Client:
                 loss_con = self.compute_LCon(global_stats, beta=beta)
                 loss = loss_task + lambda_con * loss_con
                 loss.backward()
+                # 添加梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
         # remove hooks
@@ -134,18 +137,23 @@ class Client:
 
         return copy.deepcopy(self.model.state_dict())
 
+    def validate(self, return_raw: bool = False):
+        """在验证集上评估模型性能"""
+        return self._evaluate_on_loader(self.val_loader, return_raw)
+
     def evaluate(self, return_raw: bool = False):
-        """Evaluate on the client's test set.
-        If return_raw==True, return (acc, avg_loss, correct, total).
-        Else return (acc, avg_loss).
-        """
+        """在测试集上评估模型性能"""
+        return self._evaluate_on_loader(self.test_loader, return_raw)
+
+    def _evaluate_on_loader(self, loader, return_raw: bool = False):
+        """在指定数据加载器上评估模型的通用方法"""
         self.model.eval()
         criterion = nn.CrossEntropyLoss()
         total_loss = 0.0
         correct = 0
         total = 0
         with torch.no_grad():
-            for x, y in self.test_loader:
+            for x, y in loader:
                 x = x.to(self.device)
                 y = y.to(self.device)
                 out = self.model(x)
@@ -161,3 +169,13 @@ class Client:
         else:
             return acc, avg_loss
 
+    def get_bn_dfe_stats(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """获取当前客户端的BN-DFE统计信息"""
+        bn_stats = {}
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'bn_dfe') and isinstance(module.bn_dfe, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                bn_stats[name] = {
+                    'running_mean': module.bn_dfe.running_mean.detach().cpu().clone(),
+                    'running_var': module.bn_dfe.running_var.detach().cpu().clone()
+                }
+        return bn_stats

@@ -8,6 +8,7 @@ echo "=== FDSE Federated Training (Determined AI) ==="
 echo "Python: $(which python)"
 # 设置根路径为当前目录（或上一级）
 export PYTHONPATH=$PYTHONPATH:/run/determined/workdir
+python check.py
 python3 experiments/train_fdse.py \
      --data_root data/lry/office_caltech10 \
      --rounds 500 \
@@ -19,6 +20,8 @@ python3 experiments/train_fdse.py \
      --repeats 5 \
      --pretrained \
      --verbose
+# 运行网格搜索
+#python3 grid_search_parameter2.py
 exit 0
 #pip install -r requirements.txt -i https://pypi.mirrors.ustc.edu.cn/simple/
 #python /data/YZY/CTLIB-main/setup.py install

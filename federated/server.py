@@ -46,6 +46,12 @@ class Server:
         # attach initial BN statistics
         self._update_global_bn_stats()
 
+        # 新增：最佳模型状态存储
+        self.best_global_state = None
+        self.best_personalized_dse_state = None
+        self.best_val_acc = 0.0
+        self.best_round = -1
+
     def _build_layer_groups(self, param_names: List[str]) -> List[List[str]]:
         groups = {}
         for name in param_names:
@@ -71,6 +77,48 @@ class Server:
     def _update_global_bn_stats(self):
         stats = self._extract_bn_dfe_stats()
         self.global_model._bn_dfe_stats = stats
+
+    def _aggregate_bn_dfe(self, clients_bn_stats: List[Dict[str, Dict[str, torch.Tensor]]]):
+        """聚合所有客户端的BN-DFE统计信息"""
+        if not clients_bn_stats or len(clients_bn_stats) == 0:
+            return
+
+        # 获取所有BN层名称
+        all_bn_names = set()
+        for client_stats in clients_bn_stats:
+            all_bn_names.update(client_stats.keys())
+
+        # 对每个BN层进行平均
+        for bn_name in all_bn_names:
+            means = []
+            vars_ = []
+
+            # 收集所有客户端该BN层的统计信息
+            for client_stats in clients_bn_stats:
+                if bn_name in client_stats:
+                    mean_tensor = client_stats[bn_name]['running_mean']
+                    var_tensor = client_stats[bn_name]['running_var']
+
+                    # 确保张量至少有1维
+                    if mean_tensor.dim() == 0:
+                        mean_tensor = mean_tensor.unsqueeze(0)
+                    if var_tensor.dim() == 0:
+                        var_tensor = var_tensor.unsqueeze(0)
+
+                    means.append(mean_tensor)
+                    vars_.append(var_tensor)
+
+            if means:  # 确保有统计信息可聚合
+                # 找到对应的全局BN模块
+                for name, module in self.global_model.named_modules():
+                    if name == bn_name and hasattr(module, 'bn_dfe'):
+                        # 计算平均值并更新全局BN
+                        avg_mean = torch.stack(means).mean(dim=0)
+                        avg_var = torch.stack(vars_).mean(dim=0)
+
+                        module.bn_dfe.running_mean.copy_(avg_mean)
+                        module.bn_dfe.running_var.copy_(avg_var)
+                        break
 
     def broadcast(self) -> List[nn.Module]:
         """Return a list of model copies, one per client.
@@ -126,61 +174,145 @@ class Server:
                 saved[k] = v.clone()
             self.personalized_dse_state[cid] = saved
 
-        # update BN stats attached
         self._update_global_bn_stats()
         return per_client_updates
 
     def run(self, rounds=100, local_epochs=1, lr=0.01, lambda_con=0.1, beta=0.001, personalized_tau=0.01):
-        history = {'rounds': [], 'avg_acc': [], 'avg_loss': [], 'all_acc': [], 'all_loss': []}
+        history = {
+            'rounds': [],
+            'avg_acc': [], 'avg_loss': [],
+            'all_acc': [], 'all_loss': [],
+            'val_acc': [], 'val_loss': []  # 新增验证集历史
+        }
 
         for r in range(rounds):
             lr_t = lr * (0.998 ** r)
             print(f"[Server] Starting round {r:03d} | lr={lr_t:.6f}")
 
+            # 本地训练阶段
             local_states = []
-            accs, losses, corrects, totals = [], [], [], []
-
+            clients_bn_stats = []
             model_copies = self.broadcast()
 
             for cid, c in enumerate(self.clients):
                 st = c.local_update(model_copies[cid], local_epochs, lr_t, lambda_con, beta)
                 local_states.append({k: v.detach().cpu().clone() for k, v in st.items()})
+                bn_stats = c.get_bn_dfe_stats()  # 收集BN统计信息
+                clients_bn_stats.append(bn_stats)
 
-            # evaluate all clients after aggregation
-            for cid, c in enumerate(self.clients):
-                eval_model = copy.deepcopy(self.global_model)
-                saved = self.personalized_dse_state.get(cid, {})
-                if saved:
-                    state = eval_model.state_dict()
-                    for k, v in saved.items():
-                        if k in state:
-                            state[k] = v.clone()
-                    eval_model.load_state_dict(state, strict=False)
-                c.model.load_state_dict(eval_model.state_dict(), strict=False)
-                acc, loss, correct, total = c.evaluate(return_raw=True)
-                accs.append(acc)
-                losses.append(loss)
-                corrects.append(correct)
-                totals.append(total)
-                print(f" [Client {cid}] acc={acc:.4f}, loss={loss:.4f}")
-
+            # 聚合阶段
             self.aggregate(local_states, personalized_tau)
 
-            avg_acc = np.mean(accs)
-            avg_loss = np.mean(losses)
-            all_acc = np.sum(corrects) / np.sum(totals)
-            all_loss = np.sum(np.array(losses) * np.array(totals)) / np.sum(totals)
+            # 聚合BN统计信息
+            self._aggregate_bn_dfe(clients_bn_stats)
 
-            print(f"[Server] Round {r:03d}: AVG_acc={avg_acc:.4f}, ALL_acc={all_acc:.4f}, AVG_loss={avg_loss:.4f}")
+            # 验证和测试阶段 - 使用独立的模型副本
+            val_accs, val_losses = [], []
+            test_accs, test_losses, test_corrects, test_totals = [], [], [], []
 
+            for cid, c in enumerate(self.clients):
+                # 为验证集创建独立的模型副本
+                val_model = copy.deepcopy(self.global_model)
+                saved_dse = self.personalized_dse_state.get(cid, {})
+                if saved_dse:
+                    val_state = val_model.state_dict()
+                    for k, v in saved_dse.items():
+                        if k in val_state:
+                            val_state[k] = v.clone()
+                    val_model.load_state_dict(val_state, strict=False)
+
+                # 验证集评估
+                c.model.load_state_dict(val_model.state_dict(), strict=False)
+                val_acc, val_loss = c.validate()
+                val_accs.append(val_acc)
+                val_losses.append(val_loss)
+
+                # 为测试集创建独立的模型副本
+                test_model = copy.deepcopy(self.global_model)
+                if saved_dse:
+                    test_state = test_model.state_dict()
+                    for k, v in saved_dse.items():
+                        if k in test_state:
+                            test_state[k] = v.clone()
+                    test_model.load_state_dict(test_state, strict=False)
+
+                # 测试集评估
+                c.model.load_state_dict(test_model.state_dict(), strict=False)
+                acc, loss, correct, total = c.evaluate(return_raw=True)
+                test_accs.append(acc)
+                test_losses.append(loss)
+                test_corrects.append(correct)
+                test_totals.append(total)
+
+                # 清理内存
+                del val_model, test_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # 计算平均指标
+            avg_val_acc = np.mean(val_accs)
+            avg_val_loss = np.mean(val_losses)
+            avg_test_acc = np.mean(test_accs)
+            avg_test_loss = np.mean(test_losses)
+            all_test_acc = np.sum(test_corrects) / np.sum(test_totals) if np.sum(test_totals) > 0 else 0.0
+            all_test_loss = np.sum(np.array(test_losses) * np.array(test_totals)) / np.sum(test_totals) if np.sum(test_totals) > 0 else 0.0
+
+            print(f"[Server] Round {r:03d}: VAL_acc={avg_val_acc:.4f}, TEST_acc={avg_test_acc:.4f}, "
+                  f"VAL-TEST_diff={avg_val_acc - avg_test_acc:.4f}")
+
+            # 记录历史
             history['rounds'].append(r)
-            history['avg_acc'].append(avg_acc)
-            history['avg_loss'].append(avg_loss)
-            history['all_acc'].append(all_acc)
-            history['all_loss'].append(all_loss)
+            history['avg_acc'].append(avg_test_acc)
+            history['avg_loss'].append(avg_test_loss)
+            history['all_acc'].append(all_test_acc)
+            history['all_loss'].append(all_test_loss)
+            history['val_acc'].append(avg_val_acc)
+            history['val_loss'].append(avg_val_loss)
+
+            # 模型选择：保存验证集上性能最佳的模型
+            if avg_val_acc > self.best_val_acc:
+                self.best_val_acc = avg_val_acc
+                self.best_round = r
+                self.best_global_state = copy.deepcopy(self.global_model.state_dict())
+                self.best_personalized_dse_state = copy.deepcopy(self.personalized_dse_state)
+                print(f"[Best Model] Round {r}: val_acc={avg_val_acc:.4f}, test_acc={avg_test_acc:.4f}")
+
+        # 训练结束后加载最佳模型
+        if self.best_global_state is not None:
+            print(f"[Final] Loading best model from round {self.best_round} "
+                  f"(val_acc={self.best_val_acc:.4f})")
+            self.global_model.load_state_dict(self.best_global_state)
+            self.personalized_dse_state = self.best_personalized_dse_state
+
+            # 最终评估最佳模型在所有客户端上的性能
+            print("\n=== Final Evaluation with Best Model ===")
+            final_val_accs, final_test_accs = [], []
+            for cid, c in enumerate(self.clients):
+                # 为每个客户端加载最佳个性化模型
+                best_model = copy.deepcopy(self.global_model)
+                best_dse = self.best_personalized_dse_state.get(cid, {})
+                if best_dse:
+                    best_state = best_model.state_dict()
+                    for k, v in best_dse.items():
+                        if k in best_state:
+                            best_state[k] = v.clone()
+                    best_model.load_state_dict(best_state, strict=False)
+
+                c.model.load_state_dict(best_model.state_dict(), strict=False)
+                val_acc, _ = c.validate()
+                test_acc, _ = c.evaluate()
+                final_val_accs.append(val_acc)
+                final_test_accs.append(test_acc)
+                print(f"Client {cid}: val_acc={val_acc:.4f}, test_acc={test_acc:.4f}")
+
+                del best_model
+
+            avg_final_val = np.mean(final_val_accs)
+            avg_final_test = np.mean(final_test_accs)
+            print(f"\n[Final Summary] Val: {avg_final_val:.4f}, Test: {avg_final_test:.4f}, "
+                  f"Difference: {avg_final_val - avg_final_test:.4f}")
 
         return history
-
 
 if __name__ == '__main__':
     print('Server module for FDSE federation with personalized DSE storage.')

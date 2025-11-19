@@ -1,4 +1,4 @@
-name: FDSE_pgd
+name: FDSE_check
 entrypoint: chmod 777 ./train.sh && bash ./train.sh
 searcher:
   name: single
